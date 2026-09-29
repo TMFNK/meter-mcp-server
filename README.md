@@ -49,7 +49,13 @@ Davit's compose import.
 
 ## Eval
 
-Sealed 30 day eval from the sibling repo: 90.0% (27/30), decline 36.7% at precision 0.727, validity 1.0, p50 0.77 ms per day, zero confident errors. Sibling: https://github.com/TMFNK/meter-day-classifier
+| System | Accuracy | Note |
+| --- | --- | --- |
+| `rules_floor_v1` (deterministic floor) | 86.7% | pre-registered baseline from the sibling repo |
+| `classical_logreg_v1` (this server) | **90.0%** (27/30) | decline 36.7% at precision 0.727, validity 1.0, p50 0.77 ms/day, zero confident errors |
+
+Sealed 30 day eval from the sibling repo. Full scoreboard and per-day
+predictions: https://github.com/TMFNK/meter-day-classifier
 
 What the numbers do not show: day labels are the benchmark, not a customer savings claim. Segment triage plus a real pilot come later.
 

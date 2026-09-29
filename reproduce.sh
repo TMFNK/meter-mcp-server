@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-command public run: compile + contract tests + STDIO tool list.
+# One-command public run: compile + tests + STDIO list + artifacts freeze + HTTP health/auth.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,8 +23,10 @@ print("tools: OK - 3 tools")
 PY
 
 echo "== artifacts freeze check =="
+FREEZE_REF="$(mktemp)"
 if [ -f artifacts/model.joblib ]; then
-  md5sum artifacts/* || md5 artifacts/*
+  (md5sum artifacts/* 2>/dev/null || md5 artifacts/*) > "$FREEZE_REF"
+  cat "$FREEZE_REF"
 else
   echo "artifacts not vendored yet (Step 1) - skipped"
 fi
@@ -53,5 +55,15 @@ kill $SERVER_PID 2>/dev/null || true
 trap - EXIT
 wait $SERVER_PID 2>/dev/null || true
 echo "http: OK - health 200, auth 401 on bad key"
+
+echo "== artifacts unchanged =="
+if [ -s "$FREEZE_REF" ]; then
+  (md5sum artifacts/* 2>/dev/null || md5 artifacts/*) > "$FREEZE_REF.new"
+  diff "$FREEZE_REF" "$FREEZE_REF.new" && echo "artifacts: unchanged"
+  rm -f "$FREEZE_REF" "$FREEZE_REF.new"
+else
+  echo "artifacts: nothing frozen, skipped"
+  rm -f "$FREEZE_REF" "$FREEZE_REF.new"
+fi
 
 echo "reproduce: OK"

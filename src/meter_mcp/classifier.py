@@ -43,6 +43,10 @@ BORDERLINE_FLOOR_HIGH = 0.55
 # as a plain weekday and is_weekend is 0.
 DEFAULT_DATE = "2026-01-05"
 
+# Hard cap on reason text. The template below is ~170 chars, so this is a
+# guardrail, not a formatter: it only fires if the template ever changes.
+REASON_MAX_LEN = 500
+
 # Closed feature list. Order is the column order. Must match the frozen
 # operating_point.json exactly (checked at load time).
 FEATURES = [
@@ -392,11 +396,12 @@ def build_reason(evidence: DayEvidence, label: str) -> str:
     night_med = _fmt(evidence.weekday_night_median_kwh)
     ref = _fmt(evidence.meter_reference_kwh)
     low_share = _fmt_share(evidence.low_positive_share_valid)
-    return (
+    reason = (
         f"label is {label} because night median {night_med} kWh vs meter "
         f"reference {ref} kWh; low-band share {low_share} of valid intervals; "
         f"max zero run {evidence.max_zero_run}; baseline p95 {ref} kWh."
     )
+    return reason[:REASON_MAX_LEN]
 
 
 _model_cache: dict = {}

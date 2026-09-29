@@ -257,3 +257,117 @@ def test_mcp_tool_list_and_end_to_end_call():
         assert out["label"] == "off"
 
     asyncio.run(run())
+
+
+# Step 4: guardrails - clean errors, reason cap, no traceback on the wire.
+
+
+def test_reason_length_capped():
+    assert classifier.REASON_MAX_LEN == 500
+    cases = [
+        ([0.0] * 96, 5.0, "2026-01-05"),
+        ([0.07] * 96, 0.176, "2026-03-29"),
+        ([None] * 96, 5.0, "2026-01-05"),
+        ([8.0] * 48 + [None] * 48, 8.5, "2026-01-05"),
+    ]
+    for values, ref, date in cases:
+        reason = classifier.classify_day(values, ref, date)["reason"]
+        assert len(reason) <= classifier.REASON_MAX_LEN
+
+
+@pytest.mark.parametrize(
+    "values,ref,date",
+    [
+        ([1.0] * 95, 1.0, "2026-01-05"),  # too few
+        ([1.0] * 97, 1.0, "2026-01-05"),  # too many
+        ([-1.0] * 96, 1.0, "2026-01-05"),  # negative kWh
+        ([0.0] * 96, 0.0, "2026-01-05"),  # bad reference
+        ([0.0] * 96, 5.0, "not-a-date"),  # bad date
+    ],
+)
+def test_server_impl_guardrail_matrix(values, ref, date):
+    with pytest.raises(ValueError):
+        classify_day_impl(values, ref, date)
+
+
+def test_server_impl_all_missing_is_clean_unsure():
+    out = classify_day_impl([None] * 96, 5.0, "2026-01-05")
+    _check_schema(out)
+    assert out["label"] == "unsure"
+
+
+def test_mcp_tool_error_shape_is_clean():
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    async def run():
+        with pytest.raises(ToolError) as exc:
+            await mcp.call_tool(
+                "classify_day",
+                {"values": [1.0] * 95, "meter_reference_kwh": 1.0},
+            )
+        message = str(exc.value)
+        assert "96" in message  # names the contract
+        lowered = message.lower()
+        assert "traceback" not in lowered  # no traceback on the wire
+        assert ".py" not in lowered  # no file paths
+
+    asyncio.run(run())
+
+
+def test_http_tool_error_has_no_traceback(http_client):
+    import httpx as _httpx  # noqa: F401 - documents the wire client
+
+    headers = {
+        "X-API-Key": "test",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    with mock.patch.dict(os.environ, {"MCP_API_KEY": "test"}):
+        init = http_client.post(
+            "/mcp/",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "guardrail", "version": "0"},
+                },
+            },
+            headers=headers,
+        )
+        session = init.headers.get("mcp-session-id", "")
+        assert session, "handshake must yield a session"
+        headers["mcp-session-id"] = session
+        http_client.post(
+            "/mcp/",
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            headers=headers,
+        )
+        bad = http_client.post(
+            "/mcp/",
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "classify_day",
+                    "arguments": {"values": [1.0] * 97, "meter_reference_kwh": 1.0},
+                },
+            },
+            headers=headers,
+        )
+    assert bad.status_code == 200
+    payloads = [
+        json.loads(line[6:])
+        for line in bad.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    errors = [p for p in payloads if p.get("result", {}).get("isError")]
+    assert errors, "bad input must come back as a tool error, not a crash"
+    text = errors[0]["result"]["content"][0]["text"]
+    assert "96" in text
+    lowered = (bad.text).lower()
+    assert "traceback" not in lowered
+    assert ".py" not in lowered
