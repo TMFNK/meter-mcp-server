@@ -1,50 +1,81 @@
 #!/usr/bin/env python3
 """STDIO server: frozen meter-day classifier as 3 MCP tools.
 
-Step 0: transports work, model_info is real, classify_* are stubs
-that return unsure until Step 1 vendors the frozen model.
+Step 2: typed tools delegate to the frozen Step 1 classifier.
+No fitting, no retraining, no raw CSV access. Audit logging is
+best-effort (never breaks a classification call).
+
+Note: this module must NOT use `from __future__ import annotations`.
+FastMCP 1.9.4 inspects real annotation objects at decoration time;
+string annotations break tool registration.
 """
 
-from mcp.server.fastmcp import FastMCP
+import argparse
 
-from meter_mcp import LABELS, MODEL_EVAL_ACC, MODEL_VERSION, RULES_FLOOR_ACC
+from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel
+
+from meter_mcp import classifier
+from meter_mcp.audit import log_classify_batch, log_classify_day
 
 mcp = FastMCP("meter-mcp-server")
 
 
+class DayInput(BaseModel):
+    """One meter day: 96 interval values plus the meter reference."""
+
+    values: list[float | None]
+    meter_reference_kwh: float
+    date: str | None = None
+
+
+def _audit_day(values, meter_reference_kwh, output, date=None) -> None:
+    try:
+        log_classify_day(values, meter_reference_kwh, output, date=date)
+    except Exception:
+        pass
+
+
+def _audit_batch(days, output) -> None:
+    try:
+        log_classify_batch(days, output)
+    except Exception:
+        pass
+
+
 def model_info_impl() -> dict:
     """Return frozen model version, eval numbers, labels, and limits."""
-    return {
-        "model_version": MODEL_VERSION,
-        "eval_accuracy": MODEL_EVAL_ACC,
-        "rules_floor_accuracy": RULES_FLOOR_ACC,
-        "labels": list(LABELS),
-        "inputs": "96 x 15-min kWh per day, None means missing, plus meter_reference_kwh",
-        "limits": "offline sklearn logreg, template reasons only, abstains as unsure, max 31 days per batch",
-    }
+    return classifier.model_info()
 
 
-def classify_day_impl(values: list, meter_reference_kwh: float) -> dict:
-    """Classify one meter day. Step 0 stub: always unsure, validates length."""
-    if len(values) != 96:
-        raise ValueError(f"need 96 values, got {len(values)}")
-    return {
-        "label": "unsure",
-        "reason": "Step 0 stub: frozen model lands in Step 1.",
-        "confidence": 0.0,
-        "abstained": True,
-        "model_version": MODEL_VERSION,
-    }
+def classify_day_impl(
+    values: list, meter_reference_kwh: float, date: str | None = None
+) -> dict:
+    """Classify one meter day with the frozen model."""
+    if isinstance(values, DayInput):
+        values, meter_reference_kwh, date = (
+            values.values,
+            values.meter_reference_kwh,
+            values.date,
+        )
+    output = classifier.classify_day(values, meter_reference_kwh, date)
+    _audit_day(values, meter_reference_kwh, output, date)
+    return output
 
 
 def classify_batch_impl(days: list) -> dict:
-    """Classify up to 31 days. Step 0 stub: validates shape only."""
-    if len(days) > 31:
-        raise ValueError(f"max 31 days per batch, got {len(days)}")
-    results = []
+    """Classify up to 31 days with the frozen model."""
+    normalized = []
     for day in days:
-        results.append(classify_day_impl(day["values"], day["meter_reference_kwh"]))
-    return {"results": results, "model_version": MODEL_VERSION}
+        if isinstance(day, DayInput):
+            normalized.append(day.model_dump())
+        elif isinstance(day, dict):
+            normalized.append(day)
+        else:
+            raise ValueError("each day must be an object with values")
+    output = classifier.classify_batch(normalized)
+    _audit_batch(normalized, output)
+    return output
 
 
 @mcp.tool()
@@ -54,18 +85,31 @@ def model_info() -> dict:
 
 
 @mcp.tool()
-def classify_day(values: list, meter_reference_kwh: float) -> dict:
-    """Classify one meter day. Step 0 stub: always unsure, validates length."""
-    return classify_day_impl(values, meter_reference_kwh)
+def classify_day(
+    values: list[float | None],
+    meter_reference_kwh: float,
+    date: str = "",
+) -> dict:
+    """Classify one meter day.
+
+    96 x 15-min kWh values (None means missing) plus the meter reference
+    (whole-period positive p95 per interval). Optional ISO date
+    (YYYY-MM-DD) keeps weekday buckets correct; omit it (empty string)
+    and the day is treated as a weekday. Returns label, reason,
+    confidence, abstained flag, and model version.
+    """
+    return classify_day_impl(values, meter_reference_kwh, date or None)
 
 
 @mcp.tool()
-def classify_batch(days: list) -> dict:
-    """Classify up to 31 days. Step 0 stub: validates shape only."""
+def classify_batch(days: list[DayInput]) -> dict:
+    """Classify up to 31 meter days. Same output per day, in order."""
     return classify_batch_impl(days)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args(argv)
     mcp.run()
 
 

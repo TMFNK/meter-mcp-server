@@ -129,3 +129,76 @@ def test_no_fitting_code_in_package():
         if "fit(" in text:
             hits.append(path.name)
     assert hits == [], f"fitting call found in {hits}"
+
+
+# Step 2: STDIO tool wiring over the frozen classifier.
+
+import asyncio
+
+from meter_mcp.server_stdio import (
+    DayInput,
+    classify_batch_impl,
+    classify_day_impl,
+    mcp,
+    model_info_impl,
+)
+
+
+def test_server_model_info_delegates_to_frozen_card():
+    info = model_info_impl()
+    assert info["model_version"] == "classical_logreg_v1"
+    assert len(info["features"]) == 26
+    assert info["threshold"] == 0.0
+
+
+def test_server_classify_day_returns_real_label():
+    out = classify_day_impl([0.0] * 96, 5.0, "2026-01-05")
+    _check_schema(out)
+    assert out["label"] == "off"
+    # Output must be plain JSON data (no timestamps, no numpy types).
+    json.dumps(out)
+
+
+def test_server_classify_day_rejects_bad_length():
+    with pytest.raises(ValueError, match="96"):
+        classify_day_impl([1.0] * 95, 1.0)
+
+
+def test_server_batch_accepts_models_and_dicts():
+    days = [
+        DayInput(values=[0.0] * 96, meter_reference_kwh=5.0, date="2026-01-05"),
+        {"values": [None] * 96, "meter_reference_kwh": 5.0},
+    ]
+    out = classify_batch_impl(days)
+    assert [r["label"] for r in out["results"]] == ["off", "unsure"]
+    json.dumps(out)
+
+
+def test_server_batch_cap():
+    with pytest.raises(ValueError, match="31"):
+        classify_batch_impl(
+            [{"values": [0.0] * 96, "meter_reference_kwh": 5.0}] * 32
+        )
+
+
+def test_mcp_tool_list_and_end_to_end_call():
+    async def run():
+        tools = await mcp.list_tools()
+        assert {t.name for t in tools} == {
+            "classify_day",
+            "classify_batch",
+            "model_info",
+        }
+        contents = await mcp.call_tool(
+            "classify_day",
+            {
+                "values": [0.0] * 96,
+                "meter_reference_kwh": 5.0,
+                "date": "2026-01-05",
+            },
+        )
+        out = json.loads(contents[0].text)
+        _check_schema(out)
+        assert out["label"] == "off"
+
+    asyncio.run(run())
