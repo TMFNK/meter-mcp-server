@@ -4,5 +4,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      MCP_API_KEY: ${MCP_API_KEY:-test}
+      MCP_API_KEY: ${MCP_API_KEY:?set MCP_API_KEY before starting the service}
+    volumes:
+      - meter_mcp_audit:/var/lib/meter-mcp/audit
     restart: unless-stopped
+
+volumes:
+  meter_mcp_audit:

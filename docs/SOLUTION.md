@@ -23,16 +23,18 @@ same audit line every time.
   label from last quarter still traces to the weights that made it.
 - **Abstention with a paper trail.** Thin-evidence days come back `unsure`
   with a one-line reason citing printed numbers, never a forced guess.
-  Every call appends one JSONL audit line (counts and labels only, never
-  the raw series), so a reviewer can replay what the agent saw.
+  Successful calls and classifier-level rejections append one JSONL audit
+  line. Batch lines include per-day counts, dates, labels, and abstention
+  flags, never the raw series, so a reviewer can replay the request shape
+  and outcome.
 - **Two transports, same answers.** STDIO for Claude Desktop, Code, and
   the Inspector; Streamable HTTP with a key for shared or remote use.
   `/healthz` stays public for probes; bad input returns a plain error,
   never a traceback.
 - **Runs where the data already is.** Fully offline: scikit-learn on
   commodity hardware, no GPU, no tokens, no accounts. Ships as a small
-  container (Apple containers via Davit, or Docker) that starts on an
-  8 GB Mac.
+  container (Apple containers via Davit, or Docker) with a writable audit
+  volume and health check.
 
 ## Who buys it
 
@@ -63,20 +65,30 @@ Contact: [https://www.mbitai.com](https://www.mbitai.com)
 | --- | --- |
 | Inference | 0.77 ms/day, $0 per 1,000 (no tokens, no server) |
 | Image | python:3.12-slim + pinned deps, non-root, one port |
-| Audit storage | One short JSON line per call, no raw series |
+| Audit storage | One short JSON line per call, per-day batch outcomes, no raw series |
 | License | Apache-2.0 (keeps your tree license-clean) |
 
 ## Limits, stated plainly
 
 - Day labels only. This server states what a meter did; it makes no kWh
   savings claim. Segment triage and a real pilot come later.
+- Inputs are kWh per 15-minute interval, not Wh. The frozen fit accepts
+  `meter_reference_kwh` from 0.1 through 150 and interval values up to
+  1,000 kWh. Values outside that envelope are rejected.
+- Local Europe/Berlin days may contain 92, 96, or 100 intervals. The
+  interval count must match the supplied date; omitting the date uses
+  Monday `2026-01-05`, and the response states that effective date.
 - The frozen model inherits the sibling's limits: 90.0% on a 30-day
   sealed eval, remaining errors are over-abstentions on near-noise-floor
   meters, and each meter needs its own whole-period p95 reference.
 - Template reasons only. The reason cites the printed numbers and nothing
   more; it is a communication artefact, not a second prediction.
 - HTTP auth is a shared key, not identity. It keeps casual traffic out;
-  it does not attribute calls to users.
+  it does not attribute calls to users. The key is required for MCP
+  traffic; `/healthz` remains public.
+- Audit storage is best-effort for inference: write failures emit a
+  warning and do not change the classification response. Deployments must
+  mount the writable audit volume if they need persistence.
 
 These are documented here because enterprise buyers should find limits
 before the pilot does.

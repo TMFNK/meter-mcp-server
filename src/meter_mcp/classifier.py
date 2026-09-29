@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Frozen meter-day classifier: 96 values + meter reference -> label.
+"""Frozen meter-day classifier: local-day values + meter reference -> label.
 
 Step 1 core library. No fitting happens here. The model file and the
 operating point are vendored byte-identical from the sibling repo
@@ -8,22 +8,24 @@ applies the frozen argmax-unsure rule at t=0.0.
 
 Evidence math below is vendored from MbitAI's shared meter-day harness
 (first shipped in the sibling repo). Logic is unchanged; only the input
-wiring is new: instead of raw CSVs, the caller passes 96 interval values
-(None means missing) plus the meter reference (whole-period positive
-p95 kWh per interval). Timestamps are derived from an optional ISO date
-so weekday buckets and is_weekend stay correct. Without a date the day
-is treated as a weekday (Monday 2026-01-05); this fallback is stated in
-model_info limits.
+wiring is new: instead of raw CSVs, the caller passes 92, 96, or 100
+interval values (None means missing) plus the meter reference
+(whole-period positive p95 kWh per interval). Timestamps are derived from
+an optional ISO date in Europe/Berlin so weekday buckets and is_weekend
+stay correct. Without a date the day is treated as a weekday
+(Monday 2026-01-05); this fallback is stated in model_info limits.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 import statistics
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, date as Date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import joblib
 import numpy as np
@@ -42,6 +44,15 @@ BORDERLINE_FLOOR_HIGH = 0.55
 # Default date when the caller passes none: a Monday, so buckets behave
 # as a plain weekday and is_weekend is 0.
 DEFAULT_DATE = "2026-01-05"
+LOCAL_TIMEZONE = "Europe/Berlin"
+LOCAL_ZONE = ZoneInfo(LOCAL_TIMEZONE)
+
+# These bounds describe the range represented by the frozen synthetic fit.
+# They prevent obvious unit mistakes (for example, sending Wh as kWh) from
+# being treated as model-backed predictions.
+MIN_REFERENCE_KWH = 0.1
+MAX_REFERENCE_KWH = 150.0
+MAX_INTERVAL_KWH = 1000.0
 
 # Hard cap on reason text. The template below is ~170 chars, so this is a
 # guardrail, not a formatter: it only fires if the template ever changes.
@@ -193,9 +204,23 @@ def stats_for(values) -> dict:
     }
 
 
+def _local_day_interval_count(day: Date) -> int:
+    start = datetime.combine(day, datetime.min.time(), tzinfo=LOCAL_ZONE)
+    next_start = datetime.combine(
+        day + timedelta(days=1), datetime.min.time(), tzinfo=LOCAL_ZONE
+    )
+    elapsed = next_start.astimezone(UTC) - start.astimezone(UTC)
+    return int(elapsed / INTERVAL)
+
+
 def _derived_interval_ends(date_text: str, count: int) -> tuple[datetime, ...]:
-    day = datetime.fromisoformat(date_text)
-    return tuple(day + INTERVAL * (i + 1) for i in range(count))
+    day = Date.fromisoformat(date_text)
+    start = datetime.combine(day, datetime.min.time(), tzinfo=LOCAL_ZONE)
+    start_utc = start.astimezone(UTC)
+    return tuple(
+        (start_utc + INTERVAL * (i + 1)).astimezone(LOCAL_ZONE)
+        for i in range(count)
+    )
 
 
 def _bucket_for_start(start: datetime) -> str:
@@ -433,11 +458,15 @@ def load_artifacts():
     return model, threshold
 
 
-def _validate_values(values) -> list[float | None]:
+def _validate_values(values, date: str) -> list[float | None]:
     if not isinstance(values, (list, tuple)):
-        raise ValueError("values must be a list of 96 numbers or None")
-    if len(values) != 96:
-        raise ValueError(f"need 96 values, got {len(values)}")
+        raise ValueError("values must be a list of numbers or None")
+    expected = _local_day_interval_count(Date.fromisoformat(date))
+    if len(values) != expected:
+        raise ValueError(
+            f"need {expected} values for {date} in {LOCAL_TIMEZONE}, "
+            f"got {len(values)}"
+        )
     cleaned: list[float | None] = []
     for v in values:
         if v is None:
@@ -450,9 +479,13 @@ def _validate_values(values) -> list[float | None]:
                 raise ValueError("values must be finite numbers or None")
             if f < 0:
                 raise ValueError("values must be >= 0 kWh (got negative)")
+            if f > MAX_INTERVAL_KWH:
+                raise ValueError(
+                    f"values must be <= {MAX_INTERVAL_KWH:g} kWh per interval"
+                )
             cleaned.append(f)
         else:
-            raise ValueError(f"values must be numbers or None, got {v!r}")
+            raise ValueError("values must be numbers or None")
     return cleaned
 
 
@@ -464,6 +497,11 @@ def _validate_reference(meter_reference_kwh) -> float:
     ref = float(meter_reference_kwh)
     if not math.isfinite(ref) or ref <= 0:
         raise ValueError("meter_reference_kwh must be strictly positive")
+    if not MIN_REFERENCE_KWH <= ref <= MAX_REFERENCE_KWH:
+        raise ValueError(
+            "meter_reference_kwh must be between "
+            f"{MIN_REFERENCE_KWH:g} and {MAX_REFERENCE_KWH:g} kWh"
+        )
     return ref
 
 
@@ -472,13 +510,17 @@ def _validate_date(date) -> str:
         return DEFAULT_DATE
     if not isinstance(date, str):
         raise ValueError("date must be an ISO string YYYY-MM-DD or None")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise ValueError(f"date must be ISO YYYY-MM-DD, got {date!r}")
     try:
-        datetime.fromisoformat(date).date()
+        parsed = Date.fromisoformat(date)
     except ValueError:
         raise ValueError(f"date must be ISO YYYY-MM-DD, got {date!r}")
-    if len(date) != 10:
+    if parsed.isoformat() != date:
         raise ValueError(f"date must be ISO YYYY-MM-DD, got {date!r}")
-    return date
+    if parsed == Date.max:
+        raise ValueError(f"date {date!r} cannot represent a complete local day")
+    return parsed.isoformat()
 
 
 def classify_day(
@@ -494,14 +536,15 @@ def classify_day(
         date: optional ISO day (YYYY-MM-DD) for weekday buckets and
             is_weekend. Defaults to a Monday (weekday fallback).
 
-    Returns a dict with label, reason, confidence, abstained, model_version.
+    Returns a dict with label, reason, confidence, abstained, model_version,
+    and the effective date used for bucket assignment.
     """
-    cleaned = _validate_values(values)
-    ref = _validate_reference(meter_reference_kwh)
     day = _validate_date(date)
+    cleaned = _validate_values(values, day)
+    ref = _validate_reference(meter_reference_kwh)
     is_weekend = 1.0 if datetime.fromisoformat(day).weekday() >= 5 else 0.0
 
-    timestamps = _derived_interval_ends(day, 96)
+    timestamps = _derived_interval_ends(day, len(cleaned))
     evidence = encode_day_evidence(
         cleaned, ref, timestamps, date=day,
     )
@@ -524,6 +567,7 @@ def classify_day(
         "confidence": confidence,
         "abstained": label == "unsure",
         "model_version": MODEL_VERSION,
+        "date": day,
     }
 
 
@@ -534,16 +578,19 @@ def classify_batch(days) -> dict:
     if len(days) > 31:
         raise ValueError(f"max 31 days per batch, got {len(days)}")
     results = []
-    for day in days:
+    for index, day in enumerate(days):
         if not isinstance(day, dict):
-            raise ValueError("each day must be an object with values")
-        results.append(
-            classify_day(
-                day.get("values"),
-                day.get("meter_reference_kwh"),
-                day.get("date"),
+            raise ValueError(f"day at index {index}: each day must be an object")
+        try:
+            results.append(
+                classify_day(
+                    day.get("values"),
+                    day.get("meter_reference_kwh"),
+                    day.get("date"),
+                )
             )
-        )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"day at index {index}: {exc}") from None
     return {"results": results, "model_version": MODEL_VERSION}
 
 
@@ -558,10 +605,19 @@ def model_info() -> dict:
         "threshold": threshold,
         "threshold_rule": "argmax-unsure at t=0.0 (margin clause is a no-op)",
         "features": list(FEATURES),
-        "inputs": "96 x 15-min kWh per day, None means missing, plus "
-        "meter_reference_kwh (positive p95); optional ISO date for "
-        "weekday buckets (defaults to a Monday)",
+        "inputs": "92, 96, or 100 x 15-min kWh intervals per Europe/Berlin "
+        "local day, None means missing, plus meter_reference_kwh (positive "
+        "p95 in the same kWh unit); optional ISO date for weekday buckets "
+        "(defaults to 2026-01-05)",
+        "input_units": "kWh per 15-minute interval; do not send Wh",
+        "supported_interval_counts": [92, 96, 100],
+        "supported_reference_kwh": {
+            "min": MIN_REFERENCE_KWH,
+            "max": MAX_REFERENCE_KWH,
+        },
+        "max_interval_kwh": MAX_INTERVAL_KWH,
         "limits": "offline sklearn logreg, template reasons only, abstains "
-        "as unsure, max 31 days per batch; without a date weekend days "
-        "use the weekday fallback",
+        "as unsure, max 31 days per batch; interval count must match the "
+        "Europe/Berlin local day, and values/reference must stay in the "
+        "published kWh envelope",
     }

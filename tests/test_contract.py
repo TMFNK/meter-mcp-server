@@ -42,7 +42,7 @@ def test_off_day_confident():
 def test_borderline_abstains_like_sibling_failure_mode():
     # Low-reference meter, flat floor near 40% of reference: the frozen
     # model abstains, as on the 3 sibling eval failures (meter_7, ref 0.176).
-    out = classifier.classify_day([0.07] * 96, 0.176, "2026-03-29")
+    out = classifier.classify_day([0.07] * 92, 0.176, "2026-03-29")
     _check_schema(out)
     assert out["label"] == "unsure"
     assert out["abstained"] is True
@@ -64,6 +64,43 @@ def test_no_date_uses_weekday_fallback():
     out = classifier.classify_day([0.0] * 96, 5.0)
     _check_schema(out)
     assert out["label"] == "off"
+    assert out["date"] == "2026-01-05"
+
+
+def test_dst_days_use_local_interval_counts():
+    spring = classifier.classify_day([0.0] * 92, 5.0, "2026-03-29")
+    autumn = classifier.classify_day([0.0] * 100, 5.0, "2026-10-25")
+    assert spring["label"] == "off"
+    assert autumn["label"] == "off"
+
+
+@pytest.mark.parametrize(
+    "values,date,expected",
+    [
+        ([0.0] * 92, "2026-01-05", "need 96"),
+        ([0.0] * 96, "2026-03-29", "need 92"),
+        ([0.0] * 100, "2026-10-24", "need 96"),
+    ],
+)
+def test_interval_count_must_match_local_day(values, date, expected):
+    with pytest.raises(ValueError, match=expected):
+        classifier.classify_day(values, 5.0, date)
+
+
+@pytest.mark.parametrize("date", ["2026-W02-1", "9999-12-31"])
+def test_date_errors_are_clean(date):
+    with pytest.raises(ValueError, match="date"):
+        classifier.classify_day([0.0] * 96, 5.0, date)
+
+
+def test_reference_and_interval_unit_bounds_are_explicit():
+    with pytest.raises(ValueError, match="between"):
+        classifier.classify_day([0.0] * 96, 5000.0, "2026-01-05")
+    with pytest.raises(ValueError, match="per interval"):
+        classifier.classify_day([1001.0] * 96, 5.0, "2026-01-05")
+    info = classifier.model_info()
+    assert info["input_units"].startswith("kWh")
+    assert info["supported_interval_counts"] == [92, 96, 100]
 
 
 def test_determinism():
@@ -181,6 +218,15 @@ def test_server_batch_cap():
         )
 
 
+def test_server_batch_error_names_failing_index():
+    days = [
+        {"values": [0.0] * 96, "meter_reference_kwh": 5.0},
+        {"values": [0.0] * 95, "meter_reference_kwh": 5.0},
+    ]
+    with pytest.raises(ValueError, match=r"day at index 1.*need 96"):
+        classify_batch_impl(days)
+
+
 # Step 3: HTTP health check and API key gate over Streamable HTTP.
 
 import os
@@ -190,6 +236,11 @@ import pytest
 from starlette.testclient import TestClient
 
 from meter_mcp import server_http
+
+
+@pytest.fixture(autouse=True)
+def isolated_audit_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_AUDIT_PATH", str(tmp_path / "calls.jsonl"))
 
 
 @pytest.fixture(scope="module")
@@ -230,10 +281,39 @@ def test_mcp_path_accepts_bearer_and_x_api_key(http_client):
         assert header.status_code != 401
 
 
-def test_mcp_path_open_without_key_for_local_run(http_client):
+def test_mcp_path_fails_closed_without_key(http_client):
     with mock.patch.dict(os.environ, {}, clear=True):
         response = http_client.post("/mcp", json={})
-        assert response.status_code != 401
+        assert response.status_code == 401
+
+
+def test_mcp_path_accepts_non_ascii_key_without_server_error(http_client):
+    with mock.patch.dict(os.environ, {"MCP_API_KEY": "clé"}):
+        response = http_client.post(
+            "/mcp", json={}, headers={"X-API-Key": "clé".encode("utf-8")}
+        )
+    assert response.status_code != 500
+
+
+def test_auth_compare_handles_unicode_header_value():
+    from types import SimpleNamespace
+    from starlette.responses import PlainTextResponse
+
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/mcp"),
+        headers={"x-api-key": "clé"},
+    )
+
+    async def call_next(_request):
+        return PlainTextResponse("ok")
+
+    async def run():
+        with mock.patch.dict(os.environ, {"MCP_API_KEY": "clé"}):
+            middleware = server_http.ApiKeyMiddleware(server_http.app)
+            return await middleware.dispatch(request, call_next)
+
+    response = asyncio.run(run())
+    assert response.status_code == 200
 
 
 def test_mcp_tool_list_and_end_to_end_call():
@@ -266,7 +346,7 @@ def test_reason_length_capped():
     assert classifier.REASON_MAX_LEN == 500
     cases = [
         ([0.0] * 96, 5.0, "2026-01-05"),
-        ([0.07] * 96, 0.176, "2026-03-29"),
+        ([0.07] * 92, 0.176, "2026-03-29"),
         ([None] * 96, 5.0, "2026-01-05"),
         ([8.0] * 48 + [None] * 48, 8.5, "2026-01-05"),
     ]
@@ -312,6 +392,59 @@ def test_mcp_tool_error_shape_is_clean():
         assert ".py" not in lowered  # no file paths
 
     asyncio.run(run())
+
+
+def test_mcp_tool_boundary_rejects_lax_numeric_coercion():
+    async def run():
+        for arguments in (
+            {"values": [True] * 96, "meter_reference_kwh": 5.0},
+            {"values": ["0"] * 96, "meter_reference_kwh": 5.0},
+            {"values": [0.0] * 96, "meter_reference_kwh": True},
+        ):
+            with pytest.raises(ToolError) as exc:
+                await mcp.call_tool("classify_day", arguments)
+            assert "number" in str(exc.value).lower()
+
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    asyncio.run(run())
+
+
+def test_batch_audit_contains_per_day_labels_and_abstentions(tmp_path):
+    target = tmp_path / "batch.jsonl"
+    with mock.patch.dict(os.environ, {"MCP_AUDIT_PATH": str(target)}):
+        out = classify_batch_impl(
+            [
+                {"values": [0.0] * 96, "meter_reference_kwh": 5.0},
+                {"values": [None] * 96, "meter_reference_kwh": 5.0},
+            ]
+        )
+    line = json.loads(target.read_text().splitlines()[-1])
+    assert line["status"] == "ok"
+    assert line["labels"] == [result["label"] for result in out["results"]]
+    assert line["abstained"] == [result["abstained"] for result in out["results"]]
+    assert len(line["inputs"]["days"]) == 2
+
+
+def test_rejected_call_is_audited_without_raw_values(tmp_path):
+    target = tmp_path / "rejected.jsonl"
+    with mock.patch.dict(os.environ, {"MCP_AUDIT_PATH": str(target)}):
+        with pytest.raises(ValueError):
+            classify_day_impl([0.0] * 95, 5.0)
+    line = json.loads(target.read_text().splitlines()[-1])
+    assert line["status"] == "error"
+    assert "96" in line["error"]
+    assert "values" not in line["inputs"]
+
+
+def test_audit_write_failure_emits_warning(caplog):
+    with mock.patch(
+        "meter_mcp.server_stdio.log_classify_day",
+        side_effect=OSError("read-only"),
+    ):
+        with caplog.at_level("WARNING"):
+            classify_day_impl([0.0] * 96, 5.0)
+    assert "audit write failed" in caplog.text
 
 
 def test_http_tool_error_has_no_traceback(http_client):

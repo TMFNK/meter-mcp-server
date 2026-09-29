@@ -5,12 +5,12 @@ Step 3: Streamable HTTP via FastMCP, public /healthz, MCP_API_KEY check
 on the MCP endpoint, audit logging via the shared STDIO tool impls
 (classify_day_impl / classify_batch_impl already log; no extra wiring).
 
-Auth contract: if MCP_API_KEY is set, every request under the MCP path
+Auth contract: every request under the MCP path
 (default /mcp) needs either `X-API-Key: <key>` or
 `Authorization: Bearer <key>` (constant-time compare). Anything else
 gets a clean 401 JSON with no traceback. /healthz stays public so
-Docker / CI can probe it without a key. If MCP_API_KEY is empty the
-server warns and allows local-only unauthenticated access.
+Docker / CI can probe it without a key. MCP_API_KEY is required; an empty
+key fails closed.
 """
 
 import argparse
@@ -49,9 +49,11 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         expected = _expected_key()
         if not expected:
-            return await call_next(request)
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         provided = _provided_key(request)
-        if provided and hmac.compare_digest(provided, expected):
+        if provided and hmac.compare_digest(
+            provided.encode("utf-8"), expected.encode("utf-8")
+        ):
             return await call_next(request)
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
@@ -86,7 +88,7 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     if not _expected_key():
-        print("warning: MCP_API_KEY is empty, running without auth (local only)")
+        raise SystemExit("MCP_API_KEY must be set before starting the HTTP server")
 
     import uvicorn
 
