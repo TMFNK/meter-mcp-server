@@ -1,0 +1,34 @@
+# caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# venv
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# secrets
+.env
+*.pem
+*.key
+
+# private human labels - never ship
+data/labels_v1.json
+data/raw/
+outputs/label_pack/
+*.csv
+
+# local audit logs - never commit
+audit/*.jsonl
+*.log
+
+# builds
+dist/
+build/
+*.egg-info/

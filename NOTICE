@@ -1,0 +1,15 @@
+MbitAI meter-mcp-server - NOTICE
+
+Copyright 2026 MbitAI (Eduard Beloiu). Licensed under Apache-2.0.
+See LICENSE for the full text.
+
+Provenance:
+- The frozen classifier (logreg C=1.0, 26 evidence features, t=0.0
+  argmax-unsure) is vendored from MbitAI's shared meter-day harness,
+  first shipped in TMFNK/meter-day-classifier (90.0% eval vs 86.7%
+  rules floor). Logic is byte-identical; only the MCP wrapper is new.
+- No private human labels ship in this repo. See data/README.md for
+  the three private paths used for local reproduction only.
+
+Apache-2.0 section 4(d) applies to any redistribution: keep this
+NOTICE, the LICENSE, and the provenance note above.
