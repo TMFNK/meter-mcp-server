@@ -5,6 +5,4 @@ services:
       - "8000:8000"
     environment:
       MCP_API_KEY: ${MCP_API_KEY:-test}
-    env_file:
-      - .env
     restart: unless-stopped

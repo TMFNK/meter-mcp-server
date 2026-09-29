@@ -10,4 +10,4 @@ COPY data/README.md ./data/README.md
 ENV PYTHONPATH=/app/src
 EXPOSE 8000
 USER nobody
-CMD ["python", "-m", "meter_mcp.server_http", "--port", "8000"]
+CMD ["python", "-m", "meter_mcp.server_http", "--host", "0.0.0.0", "--port", "8000"]

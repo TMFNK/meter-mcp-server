@@ -181,6 +181,61 @@ def test_server_batch_cap():
         )
 
 
+# Step 3: HTTP health check and API key gate over Streamable HTTP.
+
+import os
+from unittest import mock
+
+import pytest
+from starlette.testclient import TestClient
+
+from meter_mcp import server_http
+
+
+@pytest.fixture(scope="module")
+def http_client():
+    # One lifespan per module: the MCP session manager can only run once
+    # per FastMCP instance, so all Step 3 tests share a single client.
+    # Auth reads MCP_API_KEY per request, so env can still vary per call.
+    with TestClient(server_http.create_app()) as client:
+        yield client
+
+
+def test_healthz_is_public_and_shaped(http_client):
+    with mock.patch.dict(os.environ, {"MCP_API_KEY": "test"}):
+        response = http_client.get("/healthz")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["model_version"] == "classical_logreg_v1"
+    assert set(body["tools"]) == {"classify_day", "classify_batch", "model_info"}
+
+
+def test_mcp_path_rejects_bad_key_with_401(http_client):
+    with mock.patch.dict(os.environ, {"MCP_API_KEY": "test"}):
+        missing = http_client.post("/mcp", json={})
+        assert missing.status_code == 401
+        assert missing.json() == {"error": "unauthorized"}
+        wrong = http_client.post("/mcp", json={}, headers={"X-API-Key": "wrong"})
+        assert wrong.status_code == 401
+
+
+def test_mcp_path_accepts_bearer_and_x_api_key(http_client):
+    with mock.patch.dict(os.environ, {"MCP_API_KEY": "test"}):
+        bearer = http_client.post(
+            "/mcp", json={}, headers={"Authorization": "Bearer test"}
+        )
+        assert bearer.status_code != 401
+        header = http_client.post("/mcp", json={}, headers={"X-API-Key": "test"})
+        assert header.status_code != 401
+
+
+def test_mcp_path_open_without_key_for_local_run(http_client):
+    with mock.patch.dict(os.environ, {}, clear=True):
+        response = http_client.post("/mcp", json={})
+        assert response.status_code != 401
+
+
 def test_mcp_tool_list_and_end_to_end_call():
     async def run():
         tools = await mcp.list_tools()
