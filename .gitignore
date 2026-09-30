@@ -32,3 +32,13 @@ audit/*.jsonl
 dist/
 build/
 *.egg-info/
+
+# Cline / agent scratch
+.cline/
+.cursor/
+cursorbot
+cline.json
+clinebot/
+.claude/
+.codex/
+.opencode/
